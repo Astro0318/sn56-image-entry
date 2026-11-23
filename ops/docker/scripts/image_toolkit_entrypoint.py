@@ -208,11 +208,21 @@ def prepare_config(args: argparse.Namespace, dataset_path: Path, control_paths: 
         process.setdefault("train", {})["steps"] = int(steps_override)
 
     datasets = process.setdefault("datasets", [{}])
+    # Some templates nest a single dataset dict; normalise to a list of dataset maps.
+    if isinstance(datasets, dict):
+        datasets = [datasets]
+        process["datasets"] = datasets
     datasets[0]["folder_path"] = str(dataset_path)
     if control_paths:
         datasets[0]["control_path"] = [str(path) for path in control_paths]
     else:
         datasets[0].pop("control_path", None)
+
+    # I4: eval scores 0.5 captioned + 0.5 empty prompt. Stock templates often use
+    # ~0.05 caption dropout; raise toward EMPTY_PROMPT_RATE (default 0.45).
+    apply_empty_prompt_share(process, empty_prompt_rate_from_env())
+    # I2 (light): keep more mid-run checkpoints so promote_last_safetensors has options.
+    apply_checkpoint_save_policy(process)
 
     model_config = process.setdefault("model", {})
     model_path = cached_model_path(args.model)
@@ -380,6 +390,32 @@ def run_hidream_edit(args: argparse.Namespace, dataset_path: Path, control_paths
         env=OFFLINE_HUB_ENV,
         check=True,
     )
+
+
+def empty_prompt_rate_from_env() -> float:
+    raw = os.environ.get("EMPTY_PROMPT_RATE", "0.45")
+    rate = float(raw)
+    if not 0.0 <= rate <= 1.0:
+        raise ValueError(f"EMPTY_PROMPT_RATE must be in [0, 1], got {rate}")
+    return rate
+
+
+def apply_empty_prompt_share(process: dict, rate: float) -> None:
+    """Set caption_dropout_rate on every dataset block (I4)."""
+    datasets = process.get("datasets", [])
+    if isinstance(datasets, dict):
+        datasets = [datasets]
+        process["datasets"] = datasets
+    for dataset in datasets:
+        if isinstance(dataset, dict):
+            dataset["caption_dropout_rate"] = rate
+
+
+def apply_checkpoint_save_policy(process: dict) -> None:
+    """Keep denser step checkpoints for later last.safetensors promotion (I2 light)."""
+    save = process.setdefault("save", {})
+    save["save_every"] = int(os.environ.get("SAVE_EVERY_STEPS", "100"))
+    save["max_step_saves_to_keep"] = int(os.environ.get("MAX_STEP_SAVES", "8"))
 
 
 def list_safetensors(root: Path) -> list[Path]:

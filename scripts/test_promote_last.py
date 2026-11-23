@@ -10,6 +10,9 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "ops" / "docker" / "scripts"))
 
+from image_toolkit_entrypoint import apply_checkpoint_save_policy  # noqa: E402
+from image_toolkit_entrypoint import apply_empty_prompt_share  # noqa: E402
+from image_toolkit_entrypoint import empty_prompt_rate_from_env  # noqa: E402
 from image_toolkit_entrypoint import promote_last_safetensors  # noqa: E402
 from image_toolkit_entrypoint import select_lora_for_eval  # noqa: E402
 
@@ -18,6 +21,34 @@ def _touch(path: Path) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(b"fake")
     return path
+
+
+class EmptyPromptAndSaveTests(unittest.TestCase):
+    def test_default_empty_prompt_rate(self) -> None:
+        import os
+
+        os.environ.pop("EMPTY_PROMPT_RATE", None)
+        self.assertAlmostEqual(empty_prompt_rate_from_env(), 0.45)
+
+    def test_apply_empty_prompt_share(self) -> None:
+        process = {"datasets": [{"folder_path": "/x", "caption_dropout_rate": 0.05}]}
+        apply_empty_prompt_share(process, 0.45)
+        self.assertEqual(process["datasets"][0]["caption_dropout_rate"], 0.45)
+
+    def test_apply_empty_prompt_share_injects_missing(self) -> None:
+        process = {"datasets": [{"folder_path": "/x"}]}
+        apply_empty_prompt_share(process, 0.4)
+        self.assertEqual(process["datasets"][0]["caption_dropout_rate"], 0.4)
+
+    def test_checkpoint_save_policy(self) -> None:
+        import os
+
+        os.environ["SAVE_EVERY_STEPS"] = "100"
+        os.environ["MAX_STEP_SAVES"] = "8"
+        process: dict = {}
+        apply_checkpoint_save_policy(process)
+        self.assertEqual(process["save"]["save_every"], 100)
+        self.assertEqual(process["save"]["max_step_saves_to_keep"], 8)
 
 
 class PromoteLastTests(unittest.TestCase):
