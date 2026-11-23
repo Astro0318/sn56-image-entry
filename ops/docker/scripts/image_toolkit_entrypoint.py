@@ -2,12 +2,20 @@
 import argparse
 import json
 import os
+import re
 import shutil
 import subprocess
 import zipfile
 from pathlib import Path
 
 import yaml
+
+
+# Evaluator picks one .safetensors under checkpoints/ in this order
+# (docs/miner_image.md Output contract): last.safetensors if unique;
+# else highest trailing number; else the only file. We always promote the
+# chosen adapter to last.safetensors so the pick is deterministic (I8).
+_TRAILING_NUM = re.compile(r"(\d+)(?=\.safetensors$)", re.IGNORECASE)
 
 
 CACHE_ROOT = Path("/cache")
@@ -374,14 +382,60 @@ def run_hidream_edit(args: argparse.Namespace, dataset_path: Path, control_paths
     )
 
 
+def list_safetensors(root: Path) -> list[Path]:
+    if not root.is_dir():
+        return []
+    return sorted(path for path in root.rglob("*.safetensors") if path.is_file())
+
+
+def select_lora_for_eval(files: list[Path]) -> Path | None:
+    """Mirror the evaluator's file choice described in docs/miner_image.md."""
+    if not files:
+        return None
+    lasts = [path for path in files if path.name.lower() == "last.safetensors"]
+    if len(lasts) == 1:
+        return lasts[0]
+    numbered: list[tuple[int, Path]] = []
+    for path in files:
+        match = _TRAILING_NUM.search(path.name)
+        if match:
+            numbered.append((int(match.group(1)), path))
+    if numbered:
+        numbered.sort(key=lambda item: item[0])
+        return numbered[-1][1]
+    if len(files) == 1:
+        return files[0]
+    return None
+
+
+def promote_last_safetensors(output_dir: Path) -> Path | None:
+    """Ensure output_dir/last.safetensors is the adapter the evaluator will score."""
+    files = list_safetensors(output_dir)
+    chosen = select_lora_for_eval(files)
+    if chosen is None:
+        return None
+    target = output_dir / "last.safetensors"
+    if chosen.resolve() == target.resolve():
+        return target
+    target.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(chosen, target)
+    return target
+
+
 def main() -> None:
     args = parse_args()
     dataset_path, control_paths = prepare_dataset(args.task_id, args.training_mode)
+    output_dir = CHECKPOINTS_ROOT / args.task_id / args.expected_repo_name
     if (args.model_type, args.training_mode) == ("hidream-o1", EDIT):
         run_hidream_edit(args, dataset_path, control_paths)
-        return
-    config_path = prepare_config(args, dataset_path, control_paths)
-    subprocess.run(["python3", "run.py", str(config_path)], cwd=AI_TOOLKIT_ROOT, env=OFFLINE_HUB_ENV, check=True)
+    else:
+        config_path = prepare_config(args, dataset_path, control_paths)
+        subprocess.run(["python3", "run.py", str(config_path)], cwd=AI_TOOLKIT_ROOT, env=OFFLINE_HUB_ENV, check=True)
+    promoted = promote_last_safetensors(output_dir)
+    if promoted is None:
+        raise FileNotFoundError(
+            f"No .safetensors found under {output_dir} after training; nothing for the evaluator"
+        )
 
 
 if __name__ == "__main__":
