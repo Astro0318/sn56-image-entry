@@ -8,8 +8,11 @@ commit `5bf3ea0289ae9b97da4a8436135b330f1f7da09c`.
 ## Status (2026-11-23)
 
 - Structural layout matches the image guide (LICENSE/NOTICE/Dockerfile/entrypoint/templates).
-- This is the **stock baseline**, not a competitive crown challenger.
-- Latest published image winner is a large custom ComfyUI trainer (~37k+ LOC).
+- Original deltas on top of stock G.O.D baseline:
+  - **I8** promote `last.safetensors`
+  - **I4** `EMPTY_PROMPT_RATE` (default 0.45) caption dropout
+  - **I2-light** denser step checkpoints (`SAVE_EVERY_STEPS` / `MAX_STEP_SAVES`)
+- Still far from crown-level custom Comfy winners (~37k+ LOC).
   See `/root/sn56-work/study/IMAGE_WINNER_GAP.md`.
 - **Do not** copy winner source here (duplicate-elimination risk + fee burn).
 
