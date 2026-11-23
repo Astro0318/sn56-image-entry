@@ -1,30 +1,40 @@
-# SN56 image tournament entry (starter)
+# SN56 image entry (baseline starter)
 
-Minimal training repository for Bittensor **netuid 56 (Gradients)** image tournament.
+Minimal **image-tournament** training repository for Bittensor netuid 56 (Gradients).
 
-Built from the official starter files in
-[`gradients-ai/G.O.D`](https://github.com/gradients-ai/G.O.D) at commit
-`5bf3ea0289ae9b97da4a8436135b330f1f7da09c`.
+Built from official files in [`gradients-ai/G.O.D`](https://github.com/gradients-ai/G.O.D)
+commit `5bf3ea0289ae9b97da4a8436135b330f1f7da09c`.
 
-## Required layout (image guide)
+## Status (2026-11-23)
+
+- Structural layout matches the image guide (LICENSE/NOTICE/Dockerfile/entrypoint/templates).
+- This is the **stock baseline**, not a competitive crown challenger.
+- Latest published image winner is a large custom ComfyUI trainer (~37k+ LOC).
+  See `/root/sn56-work/study/IMAGE_WINNER_GAP.md`.
+- **Do not** copy winner source here (duplicate-elimination risk + fee burn).
+
+## Required layout
 
 - `LICENSE.md` + `NOTICE` — identical to G.O.D
 - `ops/docker/standalone-image-toolkit-trainer.dockerfile`
 - `ops/docker/scripts/image_toolkit_entrypoint.py`
-- `core/training_templates/` — AI Toolkit YAML templates
+- `core/training_templates/`
 
-## Local GPU training test (needs NVIDIA GPU)
+## Checks (CPU-only)
 
-From a full G.O.D checkout with this repo's files present, after editing
-credentials in the script:
+```bash
+./scripts/cpu_safe_checks.sh
+```
+
+## GPU local test (needs NVIDIA + credentials; not on this VPS)
+
+From a G.O.D checkout with this repo’s files present, after editing the script:
 
 ```bash
 ./ops/examples/training/run_image_task.sh
 ```
 
-On a CPU-only host that script cannot complete training (`--gpus all`).
+## Before paying the 0.4 τ fee
 
-## CUDA
-
-Trainer hosts support CUDA **12.8 or lower**. The official Dockerfile pins
-PyTorch cu128 wheels for musubi and uses `diagonalge/ai-toolkit:latest`.
+Replace this baseline with an **original** competitive recipe, publish to GitHub,
+pin a 40-char commit, then register. With low TAO, skip fee until that is done.
