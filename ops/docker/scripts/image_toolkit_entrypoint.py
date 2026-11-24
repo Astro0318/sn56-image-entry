@@ -204,8 +204,12 @@ def prepare_config(args: argparse.Namespace, dataset_path: Path, control_paths: 
     process = config_body.setdefault("process", [{}])[0]
     process["training_folder"] = str(CHECKPOINTS_ROOT / args.task_id)
     process["trigger_word"] = args.trigger_word
+    train = process.setdefault("train", {})
     if steps_override := os.environ.get("TRAIN_STEPS_OVERRIDE"):
-        process.setdefault("train", {})["steps"] = int(steps_override)
+        train["steps"] = int(steps_override)
+    else:
+        # I5: scale step budget from the task's --hours-to-complete window.
+        train["steps"] = steps_for_hours(float(args.hours_to_complete))
 
     datasets = process.setdefault("datasets", [{}])
     # Some templates nest a single dataset dict; normalise to a list of dataset maps.
@@ -381,9 +385,11 @@ def run_hidream_edit(args: argparse.Namespace, dataset_path: Path, control_paths
         ]
     if max_train_epochs := os.environ.get("MAX_TRAIN_EPOCHS"):
         train_command.extend(["--max_train_epochs", max_train_epochs])
+    elif os.environ.get("MAX_TRAIN_STEPS"):
+        train_command.extend(["--max_train_steps", os.environ["MAX_TRAIN_STEPS"]])
     else:
-        # Default to a fixed step budget so HiDream edit fits the 0.5–1.5h window.
-        train_command.extend(["--max_train_steps", os.environ.get("MAX_TRAIN_STEPS", "500")])
+        # I5: scale HiDream edit steps from the task hour budget as well.
+        train_command.extend(["--max_train_steps", str(steps_for_hours(float(args.hours_to_complete)))])
     subprocess.run(
         train_command,
         cwd=MUSUBI_ROOT,
@@ -398,6 +404,20 @@ def empty_prompt_rate_from_env() -> float:
     if not 0.0 <= rate <= 1.0:
         raise ValueError(f"EMPTY_PROMPT_RATE must be in [0, 1], got {rate}")
     return rate
+
+
+def steps_for_hours(hours: float) -> int:
+    """Map task hours to a train step budget (I5).
+
+    Image tasks are typically 0.5–1.5h. Default ~900 steps/hour, clamped.
+    Override with STEPS_PER_HOUR / MIN_TRAIN_STEPS / MAX_TRAIN_STEPS.
+    """
+    if hours <= 0:
+        raise ValueError(f"hours_to_complete must be > 0, got {hours}")
+    per_hour = float(os.environ.get("STEPS_PER_HOUR", "900"))
+    minimum = int(os.environ.get("MIN_TRAIN_STEPS", "300"))
+    maximum = int(os.environ.get("MAX_TRAIN_STEPS_CAP", "2500"))
+    return max(minimum, min(maximum, int(hours * per_hour)))
 
 
 def apply_empty_prompt_share(process: dict, rate: float) -> None:
@@ -425,7 +445,12 @@ def list_safetensors(root: Path) -> list[Path]:
 
 
 def select_lora_for_eval(files: list[Path]) -> Path | None:
-    """Mirror the evaluator's file choice described in docs/miner_image.md."""
+    """Pick an adapter to promote, then the evaluator will prefer last.safetensors.
+
+    Prefer an existing unique last.safetensors. Otherwise prefer the highest
+    trailing step number, but skip very early saves (< mid-run) when later
+    checkpoints exist (I2 stronger heuristic; still original).
+    """
     if not files:
         return None
     lasts = [path for path in files if path.name.lower() == "last.safetensors"]
@@ -438,7 +463,11 @@ def select_lora_for_eval(files: list[Path]) -> Path | None:
             numbered.append((int(match.group(1)), path))
     if numbered:
         numbered.sort(key=lambda item: item[0])
-        return numbered[-1][1]
+        max_step = numbered[-1][0]
+        # Prefer checkpoints from the second half of the run when available.
+        late = [item for item in numbered if item[0] >= max(1, max_step // 2)]
+        pool = late or numbered
+        return pool[-1][1]
     if len(files) == 1:
         return files[0]
     return None
