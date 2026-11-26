@@ -20,6 +20,7 @@ from image_toolkit_entrypoint import promote_last_safetensors  # noqa: E402
 from image_toolkit_entrypoint import select_lora_for_eval  # noqa: E402
 from image_toolkit_entrypoint import shrink_config_for_oom_retry  # noqa: E402
 from image_toolkit_entrypoint import steps_for_hours  # noqa: E402
+from image_toolkit_entrypoint import training_deadline_seconds  # noqa: E402
 import yaml  # noqa: E402
 
 
@@ -80,14 +81,30 @@ class CaptionPairAndOomTests(unittest.TestCase):
             self.assertEqual((root / "b.txt").read_text(encoding="utf-8"), "caption\n")
 
     def test_r1_family_overrides_drop_1024(self) -> None:
+        import os
+
+        os.environ.pop("TRAIN_LR_OVERRIDE", None)
+        os.environ.pop("R1_TRAIN_LR", None)
         process = {
             "save": {"save_every": 100, "max_step_saves_to_keep": 8},
             "datasets": [{"resolution": [512, 768, 1024]}],
+            "train": {"lr": 0.0001},
         }
         apply_r1_family_overrides(process, "z-image")
         self.assertEqual(process["datasets"][0]["resolution"], [512, 768])
         self.assertEqual(process["save"]["save_every"], 75)
         self.assertEqual(process["save"]["max_step_saves_to_keep"], 10)
+        self.assertEqual(process["train"]["lr"], 8e-5)
+        self.assertTrue(process["train"]["gradient_checkpointing"])
+
+    def test_training_deadline_seconds(self) -> None:
+        import os
+
+        os.environ["DEADLINE_FRACTION"] = "0.92"
+        self.assertAlmostEqual(training_deadline_seconds(1.0), 0.92 * 3600)
+        os.environ["DEADLINE_FRACTION"] = "0"
+        self.assertIsNone(training_deadline_seconds(1.0))
+        os.environ["DEADLINE_FRACTION"] = "0.92"
 
     def test_r1_family_overrides_skip_non_r1(self) -> None:
         process = {

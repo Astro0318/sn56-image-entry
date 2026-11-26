@@ -465,13 +465,20 @@ _R1_MODEL_TYPES = frozenset({"z-image", "flux2-klein-4b", "moss-image-base"})
 
 
 def apply_r1_family_overrides(process: dict, model_type: str) -> None:
-    """Light I7: slightly denser saves + safer res ladder for common R1 families."""
+    """I7: denser saves, safer res ladder, stabler LR for common R1 families."""
     if model_type not in _R1_MODEL_TYPES:
         return
     save = process.setdefault("save", {})
     # Prefer denser trail when the hour budget is short (R1 often ≤1h).
     save["save_every"] = min(int(save.get("save_every", 100)), 75)
     save["max_step_saves_to_keep"] = max(int(save.get("max_step_saves_to_keep", 8)), 10)
+    train = process.setdefault("train", {})
+    train["gradient_checkpointing"] = True
+    # Slightly lower LR than stock 1e-4 so short R1 runs overfit less.
+    if os.environ.get("TRAIN_LR_OVERRIDE"):
+        train["lr"] = float(os.environ["TRAIN_LR_OVERRIDE"])
+    else:
+        train["lr"] = float(os.environ.get("R1_TRAIN_LR", "8e-5"))
     datasets = process.get("datasets", [])
     if isinstance(datasets, dict):
         datasets = [datasets]
@@ -483,6 +490,21 @@ def apply_r1_family_overrides(process: dict, model_type: str) -> None:
         resolution = dataset.get("resolution")
         if isinstance(resolution, list) and 1024 in resolution and len(resolution) > 1:
             dataset["resolution"] = [value for value in resolution if value != 1024] or resolution
+
+
+def training_deadline_seconds(hours: float) -> float | None:
+    """I5b: wall-clock budget as a fraction of the task hour window.
+
+    Returns None when DEADLINE_FRACTION=0 (disabled). Default uses 92% of the
+    assigned hours so mid-run checkpoints can still be promoted.
+    """
+    raw = os.environ.get("DEADLINE_FRACTION", "0.92")
+    fraction = float(raw)
+    if fraction <= 0:
+        return None
+    if hours <= 0:
+        raise ValueError(f"hours_to_complete must be > 0, got {hours}")
+    return max(60.0, hours * 3600.0 * fraction)
 
 
 def looks_like_oom(text: str) -> bool:
@@ -523,11 +545,41 @@ def shrink_config_for_oom_retry(config_path: Path) -> None:
         yaml.safe_dump(config, file, default_flow_style=False)
 
 
-def run_ai_toolkit(config_path: Path) -> None:
-    """Run AI Toolkit once; on OOM, shrink config and retry once (I6)."""
-    command = ["python3", "run.py", str(config_path)]
+def _training_folder_from_config(config_path: Path) -> Path | None:
+    with config_path.open() as file:
+        config = yaml.safe_load(file)
     try:
-        subprocess.run(command, cwd=AI_TOOLKIT_ROOT, env=OFFLINE_HUB_ENV, check=True)
+        folder = config["config"]["process"][0].get("training_folder")
+    except (KeyError, IndexError, TypeError):
+        return None
+    return Path(folder) if folder else None
+
+
+def run_ai_toolkit(config_path: Path, hours: float | None = None) -> None:
+    """Run AI Toolkit; OOM retry (I6) + soft deadline leave-partial (I5b)."""
+    command = ["python3", "run.py", str(config_path)]
+    timeout = training_deadline_seconds(hours) if hours is not None else None
+
+    def _run_once(cfg: Path) -> None:
+        try:
+            subprocess.run(
+                command if cfg == config_path else ["python3", "run.py", str(cfg)],
+                cwd=AI_TOOLKIT_ROOT,
+                env=OFFLINE_HUB_ENV,
+                check=True,
+                timeout=timeout,
+            )
+        except subprocess.TimeoutExpired as timed_out:
+            # Soft deadline: keep going if any checkpoint landed for promote.
+            folder = _training_folder_from_config(cfg)
+            if folder and list_safetensors(folder):
+                return
+            raise RuntimeError(
+                f"Training hit soft deadline ({timeout:.0f}s) with no .safetensors under {folder}"
+            ) from timed_out
+
+    try:
+        _run_once(config_path)
         return
     except subprocess.CalledProcessError as first_error:
         allow = os.environ.get("ALLOW_OOM_RETRY", "1") != "0"
@@ -538,7 +590,7 @@ def run_ai_toolkit(config_path: Path) -> None:
         if not allow or (not soft_kill and not looks_like_oom(detail)):
             raise
         shrink_config_for_oom_retry(config_path)
-        subprocess.run(command, cwd=AI_TOOLKIT_ROOT, env=OFFLINE_HUB_ENV, check=True)
+        _run_once(config_path)
 
 
 def list_safetensors(root: Path) -> list[Path]:
@@ -598,7 +650,7 @@ def main() -> None:
         run_hidream_edit(args, dataset_path, control_paths)
     else:
         config_path = prepare_config(args, dataset_path, control_paths)
-        run_ai_toolkit(config_path)
+        run_ai_toolkit(config_path, hours=float(args.hours_to_complete))
     promoted = promote_last_safetensors(output_dir)
     if promoted is None:
         raise FileNotFoundError(

@@ -1,5 +1,11 @@
 # Changelog — sn56-image-entry
 
+## 2026-11-26 — I5b soft deadline + stronger I7 LR
+
+- **I5b:** `DEADLINE_FRACTION` (default 0.92) wall-clock timeout; if mid-run `.safetensors` exist, exit clean for promote
+- **I7:** R1 families also get `lr=8e-5` + forced gradient checkpointing
+- CPU tests extended
+
 ## 2026-11-26 — I1 caption pairs + I6 OOM retry + I7 R1 nudge
 
 - **I1:** `ensure_image_caption_pairs` writes empty `.txt` for orphan images after unzip
