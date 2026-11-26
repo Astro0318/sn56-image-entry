@@ -1,5 +1,12 @@
 # Changelog — sn56-image-entry
 
+## 2026-11-26 — I9 family loss knobs + eval-aligned defaults
+
+- Default `EMPTY_PROMPT_RATE=0.50`, denser saves (50 / keep 12), ~1100 steps/hour
+- `apply_family_loss_overrides` for z-image / klein / moss / qwen / hidream (LR, LoRA dim, res)
+- Checkpoint pick targets ~80% of max step (less terminal overfit)
+- Aimed at lower validator Loss; still needs GPU dry-run to verify &lt;0.3
+
 ## 2026-11-26 — I5b soft deadline + stronger I7 LR
 
 - **I5b:** `DEADLINE_FRACTION` (default 0.92) wall-clock timeout; if mid-run `.safetensors` exist, exit clean for promote

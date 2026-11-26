@@ -12,6 +12,7 @@ sys.path.insert(0, str(ROOT / "ops" / "docker" / "scripts"))
 
 from image_toolkit_entrypoint import apply_checkpoint_save_policy  # noqa: E402
 from image_toolkit_entrypoint import apply_empty_prompt_share  # noqa: E402
+from image_toolkit_entrypoint import apply_family_loss_overrides  # noqa: E402
 from image_toolkit_entrypoint import apply_r1_family_overrides  # noqa: E402
 from image_toolkit_entrypoint import empty_prompt_rate_from_env  # noqa: E402
 from image_toolkit_entrypoint import ensure_image_caption_pairs  # noqa: E402
@@ -35,7 +36,7 @@ class EmptyPromptAndSaveTests(unittest.TestCase):
         import os
 
         os.environ.pop("EMPTY_PROMPT_RATE", None)
-        self.assertAlmostEqual(empty_prompt_rate_from_env(), 0.45)
+        self.assertAlmostEqual(empty_prompt_rate_from_env(), 0.50)
 
     def test_apply_empty_prompt_share(self) -> None:
         process = {"datasets": [{"folder_path": "/x", "caption_dropout_rate": 0.05}]}
@@ -50,12 +51,12 @@ class EmptyPromptAndSaveTests(unittest.TestCase):
     def test_checkpoint_save_policy(self) -> None:
         import os
 
-        os.environ["SAVE_EVERY_STEPS"] = "100"
-        os.environ["MAX_STEP_SAVES"] = "8"
+        os.environ.pop("SAVE_EVERY_STEPS", None)
+        os.environ.pop("MAX_STEP_SAVES", None)
         process: dict = {}
         apply_checkpoint_save_policy(process)
-        self.assertEqual(process["save"]["save_every"], 100)
-        self.assertEqual(process["save"]["max_step_saves_to_keep"], 8)
+        self.assertEqual(process["save"]["save_every"], 50)
+        self.assertEqual(process["save"]["max_step_saves_to_keep"], 12)
 
     def test_steps_for_hours(self) -> None:
         import os
@@ -63,9 +64,9 @@ class EmptyPromptAndSaveTests(unittest.TestCase):
         os.environ.pop("STEPS_PER_HOUR", None)
         os.environ.pop("MIN_TRAIN_STEPS", None)
         os.environ.pop("MAX_TRAIN_STEPS_CAP", None)
-        self.assertEqual(steps_for_hours(1.0), 900)
-        self.assertEqual(steps_for_hours(0.5), 450)
-        self.assertEqual(steps_for_hours(0.2), 300)  # min clamp
+        self.assertEqual(steps_for_hours(1.0), 1100)
+        self.assertEqual(steps_for_hours(0.5), 550)
+        self.assertEqual(steps_for_hours(0.2), 400)  # min clamp
 
 
 class CaptionPairAndOomTests(unittest.TestCase):
@@ -84,18 +85,35 @@ class CaptionPairAndOomTests(unittest.TestCase):
         import os
 
         os.environ.pop("TRAIN_LR_OVERRIDE", None)
-        os.environ.pop("R1_TRAIN_LR", None)
+        os.environ.pop("ZIMAGE_LR", None)
         process = {
             "save": {"save_every": 100, "max_step_saves_to_keep": 8},
             "datasets": [{"resolution": [512, 768, 1024]}],
-            "train": {"lr": 0.0001},
+            "train": {"lr": 0.0001, "steps": 1000},
+            "network": {},
         }
         apply_r1_family_overrides(process, "z-image")
         self.assertEqual(process["datasets"][0]["resolution"], [512, 768])
-        self.assertEqual(process["save"]["save_every"], 75)
-        self.assertEqual(process["save"]["max_step_saves_to_keep"], 10)
-        self.assertEqual(process["train"]["lr"], 8e-5)
+        self.assertEqual(process["save"]["save_every"], 50)
+        self.assertEqual(process["save"]["max_step_saves_to_keep"], 12)
+        self.assertEqual(process["train"]["lr"], 6e-5)
+        self.assertEqual(process["network"]["linear"], 48)
         self.assertTrue(process["train"]["gradient_checkpointing"])
+
+    def test_hidream_family_loss_overrides(self) -> None:
+        import os
+
+        os.environ.pop("TRAIN_LR_OVERRIDE", None)
+        process = {
+            "save": {"save_every": 50, "max_step_saves_to_keep": 12},
+            "datasets": [{"resolution": [512, 768, 1024, 2048]}],
+            "train": {"steps": 1000},
+            "network": {},
+        }
+        apply_family_loss_overrides(process, "hidream-o1", hours=1.0)
+        self.assertEqual(process["datasets"][0]["resolution"], [512, 768])
+        self.assertEqual(process["train"]["lr"], 3e-5)
+        self.assertEqual(process["save"]["save_every"], 40)
 
     def test_training_deadline_seconds(self) -> None:
         import os
@@ -110,10 +128,14 @@ class CaptionPairAndOomTests(unittest.TestCase):
         process = {
             "save": {"save_every": 100, "max_step_saves_to_keep": 8},
             "datasets": [{"resolution": [512, 768, 1024]}],
+            "train": {"lr": 0.0001, "steps": 1000},
+            "network": {},
         }
         apply_r1_family_overrides(process, "flux")
+        # Non-R1 still gets denser saves; res ladder / family LR left alone.
         self.assertEqual(process["datasets"][0]["resolution"], [512, 768, 1024])
-        self.assertEqual(process["save"]["save_every"], 100)
+        self.assertEqual(process["save"]["save_every"], 50)
+        self.assertEqual(process["train"]["lr"], 0.0001)
 
     def test_looks_like_oom(self) -> None:
         self.assertTrue(looks_like_oom("CUDA out of memory"))
@@ -149,8 +171,10 @@ class PromoteLastTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             _touch(root / "name-000100.safetensors")
-            late = _touch(root / "name-000800.safetensors")
-            self.assertEqual(select_lora_for_eval(sorted(root.glob("*.safetensors"))), late)
+            mid = _touch(root / "name-000800.safetensors")
+            _touch(root / "name-001000.safetensors")
+            # Target ~80% of max(1000)=800 → prefer 000800 over terminal 001000.
+            self.assertEqual(select_lora_for_eval(sorted(root.glob("*.safetensors"))), mid)
 
     def test_prefers_existing_last(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

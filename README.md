@@ -11,7 +11,8 @@ commit `5bf3ea0289ae9b97da4a8436135b330f1f7da09c`.
 - Public repo: https://github.com/Astro0318/sn56-image-entry
 - Original deltas on top of stock G.O.D baseline:
   - **I8** promote `last.safetensors`
-  - **I4** `EMPTY_PROMPT_RATE` (default 0.45) caption dropout
+  - **I4** `EMPTY_PROMPT_RATE` (default 0.50) caption dropout
+  - **I9** family loss knobs (z-image / qwen / hidream / moss / klein)
   - **I2** denser saves + prefer second-half checkpoints
   - **I5** scale train steps from `--hours-to-complete`
 - Still far from crown-level custom Comfy winners (~37k+ LOC).

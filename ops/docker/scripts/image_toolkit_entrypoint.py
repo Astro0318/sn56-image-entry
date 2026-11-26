@@ -243,12 +243,12 @@ def prepare_config(args: argparse.Namespace, dataset_path: Path, control_paths: 
         datasets[0].pop("control_path", None)
 
     # I4: eval scores 0.5 captioned + 0.5 empty prompt. Stock templates often use
-    # ~0.05 caption dropout; raise toward EMPTY_PROMPT_RATE (default 0.45).
+    # ~0.05 caption dropout; raise toward EMPTY_PROMPT_RATE (default 0.50).
     apply_empty_prompt_share(process, empty_prompt_rate_from_env())
-    # I2 (light): keep more mid-run checkpoints so promote_last_safetensors has options.
+    # I2: denser checkpoints so promote_last_safetensors has a late-run choice.
     apply_checkpoint_save_policy(process)
-    # I7 (light): nudge R1-heavy families without rewriting winner Comfy stacks.
-    apply_r1_family_overrides(process, args.model_type)
+    # I7/I9: family-specific LR / LoRA / res / step nudges aimed at lower eval loss.
+    apply_family_loss_overrides(process, args.model_type, float(args.hours_to_complete))
 
     model_config = process.setdefault("model", {})
     model_path = cached_model_path(args.model)
@@ -421,7 +421,8 @@ def run_hidream_edit(args: argparse.Namespace, dataset_path: Path, control_paths
 
 
 def empty_prompt_rate_from_env() -> float:
-    raw = os.environ.get("EMPTY_PROMPT_RATE", "0.45")
+    # Match eval's 0.5/0.5 captioned vs empty mix by default (I4).
+    raw = os.environ.get("EMPTY_PROMPT_RATE", "0.50")
     rate = float(raw)
     if not 0.0 <= rate <= 1.0:
         raise ValueError(f"EMPTY_PROMPT_RATE must be in [0, 1], got {rate}")
@@ -431,14 +432,14 @@ def empty_prompt_rate_from_env() -> float:
 def steps_for_hours(hours: float) -> int:
     """Map task hours to a train step budget (I5).
 
-    Image tasks are typically 0.5–1.5h. Default ~900 steps/hour, clamped.
+    Image tasks are typically 0.5–1.5h. Default ~1100 steps/hour, clamped.
     Override with STEPS_PER_HOUR / MIN_TRAIN_STEPS / MAX_TRAIN_STEPS.
     """
     if hours <= 0:
         raise ValueError(f"hours_to_complete must be > 0, got {hours}")
-    per_hour = float(os.environ.get("STEPS_PER_HOUR", "900"))
-    minimum = int(os.environ.get("MIN_TRAIN_STEPS", "300"))
-    maximum = int(os.environ.get("MAX_TRAIN_STEPS_CAP", "2500"))
+    per_hour = float(os.environ.get("STEPS_PER_HOUR", "1100"))
+    minimum = int(os.environ.get("MIN_TRAIN_STEPS", "400"))
+    maximum = int(os.environ.get("MAX_TRAIN_STEPS_CAP", "2800"))
     return max(minimum, min(maximum, int(hours * per_hour)))
 
 
@@ -454,42 +455,109 @@ def apply_empty_prompt_share(process: dict, rate: float) -> None:
 
 
 def apply_checkpoint_save_policy(process: dict) -> None:
-    """Keep denser step checkpoints for later last.safetensors promotion (I2 light)."""
+    """Keep denser step checkpoints for later last.safetensors promotion (I2)."""
     save = process.setdefault("save", {})
-    save["save_every"] = int(os.environ.get("SAVE_EVERY_STEPS", "100"))
-    save["max_step_saves_to_keep"] = int(os.environ.get("MAX_STEP_SAVES", "8"))
+    save["save_every"] = int(os.environ.get("SAVE_EVERY_STEPS", "50"))
+    save["max_step_saves_to_keep"] = int(os.environ.get("MAX_STEP_SAVES", "12"))
 
 
-# Round-1 image slots historically concentrate on these families (public fields).
+# Live 2026-11-23 field: R1 Z-Image / Klein / MOSS; later Qwen + HiDream.
 _R1_MODEL_TYPES = frozenset({"z-image", "flux2-klein-4b", "moss-image-base"})
 
 
 def apply_r1_family_overrides(process: dict, model_type: str) -> None:
-    """I7: denser saves, safer res ladder, stabler LR for common R1 families."""
-    if model_type not in _R1_MODEL_TYPES:
-        return
+    """Backward-compatible wrapper → apply_family_loss_overrides(hours=1.0)."""
+    apply_family_loss_overrides(process, model_type, hours=1.0)
+
+
+def _drop_high_res(dataset: dict, drop_from: int = 1024) -> None:
+    resolution = dataset.get("resolution")
+    if isinstance(resolution, list) and drop_from in resolution and len(resolution) > 1:
+        dataset["resolution"] = [value for value in resolution if value < drop_from] or resolution
+
+
+def apply_family_loss_overrides(process: dict, model_type: str, hours: float) -> None:
+    """I7/I9: per-family knobs aimed at lower validator loss (original, not a winner paste)."""
     save = process.setdefault("save", {})
-    # Prefer denser trail when the hour budget is short (R1 often ≤1h).
-    save["save_every"] = min(int(save.get("save_every", 100)), 75)
-    save["max_step_saves_to_keep"] = max(int(save.get("max_step_saves_to_keep", 8)), 10)
     train = process.setdefault("train", {})
-    train["gradient_checkpointing"] = True
-    # Slightly lower LR than stock 1e-4 so short R1 runs overfit less.
-    if os.environ.get("TRAIN_LR_OVERRIDE"):
-        train["lr"] = float(os.environ["TRAIN_LR_OVERRIDE"])
-    else:
-        train["lr"] = float(os.environ.get("R1_TRAIN_LR", "8e-5"))
+    network = process.setdefault("network", {})
     datasets = process.get("datasets", [])
     if isinstance(datasets, dict):
         datasets = [datasets]
         process["datasets"] = datasets
-    for dataset in datasets:
-        if not isinstance(dataset, dict):
-            continue
-        # Drop 1024 from the ladder first so VRAM-heavy R1 slots finish more often.
-        resolution = dataset.get("resolution")
-        if isinstance(resolution, list) and 1024 in resolution and len(resolution) > 1:
-            dataset["resolution"] = [value for value in resolution if value != 1024] or resolution
+
+    train["gradient_checkpointing"] = True
+    if os.environ.get("TRAIN_LR_OVERRIDE"):
+        train["lr"] = float(os.environ["TRAIN_LR_OVERRIDE"])
+
+    # Denser saves help every family; R1/R3 get even denser.
+    save["save_every"] = min(int(save.get("save_every", 50)), 50)
+    save["max_step_saves_to_keep"] = max(int(save.get("max_step_saves_to_keep", 12)), 12)
+
+    # Mild step uplift within the hour budget for short tournament windows.
+    if hours > 0 and "TRAIN_STEPS_OVERRIDE" not in os.environ:
+        steps = int(train.get("steps") or steps_for_hours(hours))
+        if model_type in _R1_MODEL_TYPES | {"qwen-image", "hidream-o1"}:
+            train["steps"] = min(int(os.environ.get("MAX_TRAIN_STEPS_CAP", "2800")), int(steps * 1.08))
+
+    if model_type == "z-image":
+        if "TRAIN_LR_OVERRIDE" not in os.environ:
+            train["lr"] = float(os.environ.get("ZIMAGE_LR", "6e-5"))
+        network["linear"] = int(os.environ.get("ZIMAGE_LINEAR", "48"))
+        network["linear_alpha"] = int(os.environ.get("ZIMAGE_LINEAR_ALPHA", "48"))
+        network.setdefault("conv", 16)
+        network.setdefault("conv_alpha", 16)
+        for dataset in datasets:
+            if isinstance(dataset, dict):
+                _drop_high_res(dataset, 1024)
+
+    elif model_type == "flux2-klein-4b":
+        if "TRAIN_LR_OVERRIDE" not in os.environ:
+            train["lr"] = float(os.environ.get("KLEIN_LR", "7e-5"))
+        network["linear"] = int(os.environ.get("KLEIN_LINEAR", "40"))
+        network["linear_alpha"] = int(os.environ.get("KLEIN_LINEAR_ALPHA", "40"))
+        for dataset in datasets:
+            if isinstance(dataset, dict):
+                _drop_high_res(dataset, 1024)
+
+    elif model_type == "moss-image-base":
+        if "TRAIN_LR_OVERRIDE" not in os.environ:
+            train["lr"] = float(os.environ.get("MOSS_LR", "6e-5"))
+        network["linear"] = int(os.environ.get("MOSS_LINEAR", "40"))
+        network["linear_alpha"] = int(os.environ.get("MOSS_LINEAR_ALPHA", "40"))
+        for dataset in datasets:
+            if isinstance(dataset, dict):
+                _drop_high_res(dataset, 1024)
+
+    elif model_type == "qwen-image":
+        # Live R2 losses sit ~0.11; keep moderate LR + drop 1024 for stability.
+        if "TRAIN_LR_OVERRIDE" not in os.environ:
+            train["lr"] = float(os.environ.get("QWEN_LR", "7e-5"))
+        network["linear"] = int(os.environ.get("QWEN_LINEAR", "48"))
+        network["linear_alpha"] = int(os.environ.get("QWEN_LINEAR_ALPHA", "48"))
+        train["train_text_encoder"] = False
+        for dataset in datasets:
+            if isinstance(dataset, dict):
+                _drop_high_res(dataset, 1024)
+
+    elif model_type == "hidream-o1":
+        # Live R3 contender ~0.25; avoid huge res + keep conservative LR.
+        if "TRAIN_LR_OVERRIDE" not in os.environ:
+            train["lr"] = float(os.environ.get("HIDREAM_LR", "3e-5"))
+        network["linear"] = int(os.environ.get("HIDREAM_LINEAR", "40"))
+        network["linear_alpha"] = int(os.environ.get("HIDREAM_LINEAR_ALPHA", "40"))
+        save["save_every"] = min(int(save.get("save_every", 50)), 40)
+        for dataset in datasets:
+            if isinstance(dataset, dict):
+                _drop_high_res(dataset, 2048)
+                _drop_high_res(dataset, 1024)
+
+    elif model_type in _R1_MODEL_TYPES:
+        if "TRAIN_LR_OVERRIDE" not in os.environ:
+            train["lr"] = float(os.environ.get("R1_TRAIN_LR", "7e-5"))
+        for dataset in datasets:
+            if isinstance(dataset, dict):
+                _drop_high_res(dataset, 1024)
 
 
 def training_deadline_seconds(hours: float) -> float | None:
@@ -619,10 +687,12 @@ def select_lora_for_eval(files: list[Path]) -> Path | None:
     if numbered:
         numbered.sort(key=lambda item: item[0])
         max_step = numbered[-1][0]
-        # Prefer checkpoints from the second half of the run when available.
-        late = [item for item in numbered if item[0] >= max(1, max_step // 2)]
+        # Prefer ~80% through the run: late enough to fit, less terminal overfit (I2).
+        floor = max(1, int(max_step * 0.55))
+        target = max(floor, int(max_step * 0.80))
+        late = [item for item in numbered if item[0] >= floor]
         pool = late or numbered
-        return pool[-1][1]
+        return min(pool, key=lambda item: (abs(item[0] - target), -item[0]))[1]
     if len(files) == 1:
         return files[0]
     return None
