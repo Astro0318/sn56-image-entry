@@ -12,10 +12,15 @@ sys.path.insert(0, str(ROOT / "ops" / "docker" / "scripts"))
 
 from image_toolkit_entrypoint import apply_checkpoint_save_policy  # noqa: E402
 from image_toolkit_entrypoint import apply_empty_prompt_share  # noqa: E402
+from image_toolkit_entrypoint import apply_r1_family_overrides  # noqa: E402
 from image_toolkit_entrypoint import empty_prompt_rate_from_env  # noqa: E402
+from image_toolkit_entrypoint import ensure_image_caption_pairs  # noqa: E402
+from image_toolkit_entrypoint import looks_like_oom  # noqa: E402
 from image_toolkit_entrypoint import promote_last_safetensors  # noqa: E402
 from image_toolkit_entrypoint import select_lora_for_eval  # noqa: E402
+from image_toolkit_entrypoint import shrink_config_for_oom_retry  # noqa: E402
 from image_toolkit_entrypoint import steps_for_hours  # noqa: E402
+import yaml  # noqa: E402
 
 
 def _touch(path: Path) -> Path:
@@ -60,6 +65,66 @@ class EmptyPromptAndSaveTests(unittest.TestCase):
         self.assertEqual(steps_for_hours(1.0), 900)
         self.assertEqual(steps_for_hours(0.5), 450)
         self.assertEqual(steps_for_hours(0.2), 300)  # min clamp
+
+
+class CaptionPairAndOomTests(unittest.TestCase):
+    def test_ensure_image_caption_pairs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "a.png").write_bytes(b"img")
+            (root / "b.jpg").write_bytes(b"img")
+            (root / "b.txt").write_text("caption\n", encoding="utf-8")
+            created = ensure_image_caption_pairs(root)
+            self.assertEqual(created, 1)
+            self.assertTrue((root / "a.txt").is_file())
+            self.assertEqual((root / "b.txt").read_text(encoding="utf-8"), "caption\n")
+
+    def test_r1_family_overrides_drop_1024(self) -> None:
+        process = {
+            "save": {"save_every": 100, "max_step_saves_to_keep": 8},
+            "datasets": [{"resolution": [512, 768, 1024]}],
+        }
+        apply_r1_family_overrides(process, "z-image")
+        self.assertEqual(process["datasets"][0]["resolution"], [512, 768])
+        self.assertEqual(process["save"]["save_every"], 75)
+        self.assertEqual(process["save"]["max_step_saves_to_keep"], 10)
+
+    def test_r1_family_overrides_skip_non_r1(self) -> None:
+        process = {
+            "save": {"save_every": 100, "max_step_saves_to_keep": 8},
+            "datasets": [{"resolution": [512, 768, 1024]}],
+        }
+        apply_r1_family_overrides(process, "flux")
+        self.assertEqual(process["datasets"][0]["resolution"], [512, 768, 1024])
+        self.assertEqual(process["save"]["save_every"], 100)
+
+    def test_looks_like_oom(self) -> None:
+        self.assertTrue(looks_like_oom("CUDA out of memory"))
+        self.assertFalse(looks_like_oom("validation failed"))
+
+    def test_shrink_config_for_oom_retry(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "cfg.yaml"
+            path.write_text(
+                yaml.safe_dump(
+                    {
+                        "config": {
+                            "process": [
+                                {
+                                    "train": {"steps": 900},
+                                    "datasets": [{"resolution": [512, 768, 1024]}],
+                                }
+                            ]
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            shrink_config_for_oom_retry(path)
+            loaded = yaml.safe_load(path.read_text(encoding="utf-8"))
+            process = loaded["config"]["process"][0]
+            self.assertEqual(process["train"]["steps"], 450)
+            self.assertEqual(process["datasets"][0]["resolution"], [512])
 
 
 class PromoteLastTests(unittest.TestCase):

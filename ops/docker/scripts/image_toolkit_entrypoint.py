@@ -181,7 +181,27 @@ def prepare_dataset(task_id: str, training_mode: str) -> tuple[Path, list[Path]]
 
     if copied == 0:
         raise RuntimeError(f"No supported image/caption files found in {zip_path}")
+    # I1: every image must have a sibling .txt so the trainer/eval pairing is stable.
+    ensure_image_caption_pairs(IMAGE_DATASET_ROOT)
     return IMAGE_DATASET_ROOT, []
+
+
+def ensure_image_caption_pairs(dataset_root: Path) -> int:
+    """Create empty .txt captions for images that lack them (I1).
+
+    Eval mixes captioned and empty prompts; orphan images without captions are a
+    common silent quality hit. Returns how many caption stubs were written.
+    """
+    image_suffixes = {".jpg", ".jpeg", ".png", ".webp"}
+    created = 0
+    for image_path in sorted(dataset_root.iterdir()):
+        if not image_path.is_file() or image_path.suffix.lower() not in image_suffixes:
+            continue
+        caption_path = image_path.with_suffix(".txt")
+        if not caption_path.exists():
+            caption_path.write_text("\n", encoding="utf-8")
+            created += 1
+    return created
 
 
 def prepare_config(args: argparse.Namespace, dataset_path: Path, control_paths: list[Path]) -> Path:
@@ -227,6 +247,8 @@ def prepare_config(args: argparse.Namespace, dataset_path: Path, control_paths: 
     apply_empty_prompt_share(process, empty_prompt_rate_from_env())
     # I2 (light): keep more mid-run checkpoints so promote_last_safetensors has options.
     apply_checkpoint_save_policy(process)
+    # I7 (light): nudge R1-heavy families without rewriting winner Comfy stacks.
+    apply_r1_family_overrides(process, args.model_type)
 
     model_config = process.setdefault("model", {})
     model_path = cached_model_path(args.model)
@@ -438,6 +460,87 @@ def apply_checkpoint_save_policy(process: dict) -> None:
     save["max_step_saves_to_keep"] = int(os.environ.get("MAX_STEP_SAVES", "8"))
 
 
+# Round-1 image slots historically concentrate on these families (public fields).
+_R1_MODEL_TYPES = frozenset({"z-image", "flux2-klein-4b", "moss-image-base"})
+
+
+def apply_r1_family_overrides(process: dict, model_type: str) -> None:
+    """Light I7: slightly denser saves + safer res ladder for common R1 families."""
+    if model_type not in _R1_MODEL_TYPES:
+        return
+    save = process.setdefault("save", {})
+    # Prefer denser trail when the hour budget is short (R1 often ≤1h).
+    save["save_every"] = min(int(save.get("save_every", 100)), 75)
+    save["max_step_saves_to_keep"] = max(int(save.get("max_step_saves_to_keep", 8)), 10)
+    datasets = process.get("datasets", [])
+    if isinstance(datasets, dict):
+        datasets = [datasets]
+        process["datasets"] = datasets
+    for dataset in datasets:
+        if not isinstance(dataset, dict):
+            continue
+        # Drop 1024 from the ladder first so VRAM-heavy R1 slots finish more often.
+        resolution = dataset.get("resolution")
+        if isinstance(resolution, list) and 1024 in resolution and len(resolution) > 1:
+            dataset["resolution"] = [value for value in resolution if value != 1024] or resolution
+
+
+def looks_like_oom(text: str) -> bool:
+    lowered = text.lower()
+    needles = (
+        "out of memory",
+        "cuda out of memory",
+        "cudamemalloc",
+        "cuda error: out of memory",
+        "resource exhausted",
+        "torch.cuda.outofmemoryerror",
+    )
+    return any(needle in lowered for needle in needles)
+
+
+def shrink_config_for_oom_retry(config_path: Path) -> None:
+    """I6: rewrite prepared YAML once — lower res ladder + fewer steps."""
+    with config_path.open() as file:
+        config = yaml.safe_load(file)
+    process = config["config"]["process"][0]
+    train = process.setdefault("train", {})
+    steps = int(train.get("steps", 500))
+    train["steps"] = max(200, steps // 2)
+    datasets = process.get("datasets", [])
+    if isinstance(datasets, dict):
+        datasets = [datasets]
+        process["datasets"] = datasets
+    for dataset in datasets:
+        if not isinstance(dataset, dict):
+            continue
+        resolution = dataset.get("resolution")
+        if isinstance(resolution, list) and resolution:
+            # Keep only the lowest bucket on retry.
+            dataset["resolution"] = [min(resolution)]
+        elif isinstance(resolution, int):
+            dataset["resolution"] = max(256, resolution // 2)
+    with config_path.open("w") as file:
+        yaml.safe_dump(config, file, default_flow_style=False)
+
+
+def run_ai_toolkit(config_path: Path) -> None:
+    """Run AI Toolkit once; on OOM, shrink config and retry once (I6)."""
+    command = ["python3", "run.py", str(config_path)]
+    try:
+        subprocess.run(command, cwd=AI_TOOLKIT_ROOT, env=OFFLINE_HUB_ENV, check=True)
+        return
+    except subprocess.CalledProcessError as first_error:
+        allow = os.environ.get("ALLOW_OOM_RETRY", "1") != "0"
+        soft_kill = first_error.returncode in {137, 143}
+        detail = str(first_error)
+        if first_error.stderr:
+            detail = f"{detail}\n{first_error.stderr}"
+        if not allow or (not soft_kill and not looks_like_oom(detail)):
+            raise
+        shrink_config_for_oom_retry(config_path)
+        subprocess.run(command, cwd=AI_TOOLKIT_ROOT, env=OFFLINE_HUB_ENV, check=True)
+
+
 def list_safetensors(root: Path) -> list[Path]:
     if not root.is_dir():
         return []
@@ -495,7 +598,7 @@ def main() -> None:
         run_hidream_edit(args, dataset_path, control_paths)
     else:
         config_path = prepare_config(args, dataset_path, control_paths)
-        subprocess.run(["python3", "run.py", str(config_path)], cwd=AI_TOOLKIT_ROOT, env=OFFLINE_HUB_ENV, check=True)
+        run_ai_toolkit(config_path)
     promoted = promote_last_safetensors(output_dir)
     if promoted is None:
         raise FileNotFoundError(
